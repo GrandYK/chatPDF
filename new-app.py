@@ -7,6 +7,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 import time
+import re  # 新增：正则表达式，用于提取公式
 
 # ===================== 页面基础配置（UI优化）=====================
 st.set_page_config(
@@ -49,6 +50,44 @@ h1, h2, h3 {color: #2e4057;}
 </style>
 """, unsafe_allow_html=True)
 
+# 核心配置：启用 KaTeX 渲染复杂 LaTeX 公式
+# 引入 KaTeX 官方资源（最新版，完整功能）+ 全局样式
+st.markdown("""
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" integrity="sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js" integrity="sha384-XjKyOOlGwcjNTAIQHIpgOno0Hl1YQqzUOEleOLALmuqehneUG+vnGctmUb0ZY0l8" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" integrity="sha384-+VBxd3r6XgURycqtZ117nYw44OOcIax56Z4dCRWbxyPt0Koah1uHoK0o4+/RRE05" crossorigin="anonymous"></script>
+<script>
+    document.addEventListener("DOMContentLoaded", function() {
+        renderMathInElement(document.body, {
+            delimiters: [
+                {left: "$$", right: "$$", display: true},  // 块级公式（居中，大字体）
+                {left: "$", right: "$", display: false},   // 行内公式（嵌入文本）
+                {left: "\\(", right: "\\)", display: false},
+                {left: "\\[", right: "\\]", display: true}
+            ],
+            throwOnError: false,  // 忽略解析错误，避免公式不显示
+            errorColor: "#ff0000", // 错误公式标红（便于排查）
+            strict: "ignore"      // 兼容非标准LaTeX语法
+        });
+    });
+</script>
+<style>
+/* 优化公式显示样式 */
+.katex-display {
+    font-size: 1.3em !important;  /* 放大公式（适配页面） */
+    margin: 15px 0 !important;    /* 增加上下间距 */
+    overflow-x: auto !important;  /* 长公式横向滚动，避免截断 */
+    padding: 5px 10px !important;
+}
+.katex {
+    font-size: 1.1em !important;  /* 行内公式放大 */
+}
+/* 修复Streamlit容器冲突 */
+div[data-testid="stMarkdownContainer"] .katex {
+    white-space: normal !important;
+}
+</style>
+""", unsafe_allow_html=True)
 # ===================== 初始化配置 =====================
 # 读取秘钥
 try:
@@ -151,7 +190,7 @@ def init_vector_db(all_text):
             return None
 
 def rag_answer(vector_db, question, chat_history, top_k=5, temp=0.1):
-    """核心问答函数，带完整错误处理"""
+    """核心问答函数，新增公式自动提取+渲染"""
     if not vector_db:
         st.error("⚠️ 向量库未初始化！请先上传并加载文件")
         return ""
@@ -162,52 +201,122 @@ def rag_answer(vector_db, question, chat_history, top_k=5, temp=0.1):
     
     with st.spinner("🔍 正在检索相关内容并生成回答..."):
         try:
-            # 检索相关文档
+            # 1. 检索相关文档
             relevant_docs = vector_db.similarity_search(query=question, k=top_k)
             if not relevant_docs:
                 st.warning("⚠️ 未检索到相关内容，请调整问题或增加检索条数")
                 return "未在文档中找到相关信息"
             
-            # 拼接上下文
+            # 2. 拼接上下文（保留原始公式格式）
             context = ""
             for idx, doc in enumerate(relevant_docs[:3]):
                 context += f"相关内容{idx+1}：\n{doc.page_content}\n\n"
             
-            # 拼接历史对话（仅最近3轮）
-            history_text = ""
-            if chat_history:
-                recent_history = chat_history[-3:]
-                for idx, (q, a) in enumerate(recent_history):
-                    history_text += f"历史对话{idx+1}：\n用户：{q}\n助手：{a}\n\n"
-            
-            # 调用大模型
+            # 3. 调用大模型（要求返回公式时用LaTeX格式）
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 temperature=temp,
                 messages=[
                     {"role": "system", "content": """你是一个专业的文档问答助手，严格遵守以下规则：
 1. 仅使用提供的「相关内容」回答问题，绝对不编造任何信息；
-2. 如果相关内容中没有答案，明确说明「未在文档中找到相关信息」；
-3. 结合历史对话理解上下文，回答要简洁、准确、有针对性；
-4. 优先使用文档中的原文表述，避免意译导致偏差；
+2. 如果回答中包含公式，必须用标准LaTeX格式书写（行内公式用$...$，块级公式用$$...$$）；
+3. 公式中的上标用^、下标用_，分式用\\frac，偏导数用\\partial，确保LaTeX语法正确；
+4. 结合历史对话理解上下文，回答要简洁、准确、有针对性；
 5. 回答使用中文，格式清晰，重点内容可加粗。"""},
                     {"role": "user", "content": f"""相关内容（仅基于此回答）：
 {context}
 
 历史对话（仅用于理解上下文）：
-{history_text}
+{chat_history}
 
 当前问题：
 {question}"""}
                 ]
             )
             answer = response.choices[0].message.content.strip()
+            
+            # 4. 返回原始回答（后续在显示环节拆分公式+渲染）
             return answer if answer else "未在文档中找到相关信息"
+        
         except Exception as e:
             error_msg = str(e)[:200]
             st.error(f"❌ 回答生成失败：{error_msg}")
             st.info("建议检查：1.API Key是否有效 2.Base URL是否正确 3.网络是否正常")
             return ""
+
+# ========== 新增：公式拆分+渲染函数 ==========
+def clean_text_for_rendering(text):
+    """
+    清理文本中多余的换行符和空白，避免公式被错误拆分：
+    - 合并连续的换行符（保留段落间的空行）
+    - 清理公式前后的换行，让公式和文本自然衔接
+    """
+    if not text:
+        return text
+    
+    # 1. 合并连续的换行符（保留段落间的空行）
+    # 先把所有换行替换为 \n，再合并连续的 \n 为单个 \n
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # 合并连续的换行（保留段落间的空行）
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # 2. 清理公式前后的换行（关键！避免公式被拆成多行）
+    # 匹配块级公式 $$...$$ 前后的换行，清理掉
+    text = re.sub(r'\n+(\$\$.*?\$\$)\n+', r' \1 ', text, flags=re.DOTALL)
+    # 匹配行内公式 $...$ 前后的换行，清理掉
+    text = re.sub(r'\n+(\$.*?\$)\n+', r' \1 ', text, flags=re.DOTALL)
+    
+    # 3. 清理多余的空格和制表符
+    text = re.sub(r' +', ' ', text)  # 合并连续空格
+    text = re.sub(r'\t+', ' ', text) # 替换制表符为空格
+    
+    return text.strip()
+
+def render_text_with_formulas(text):
+    """
+    优化后的公式渲染函数：
+    - 先清理文本中的多余换行
+    - 行内公式用 markdown 包裹，保持和文本同行
+    - 块级公式居中显示，避免不必要的换行
+    """
+    if not text:
+        return
+    
+    # 关键：先清理文本中的多余换行
+    cleaned_text = clean_text_for_rendering(text)
+    
+    # 正则表达式：优先匹配块级公式，避免行内公式覆盖
+    pattern = r'(\$\$.*?\$\$)|(\$.*?\$)'
+    parts = re.split(pattern, cleaned_text, flags=re.DOTALL)
+    
+    # 用于拼接行内公式和前后文本，避免不必要的换行
+    current_text = ""
+    
+    for part in parts:
+        if part is None or part == "":
+            continue
+        
+        # 块级公式（$$...$$）
+        if part.startswith("$$") and part.endswith("$$"):
+            # 先输出当前累积的文本
+            if current_text.strip():
+                st.markdown(current_text, unsafe_allow_html=True)
+                current_text = ""
+            # 渲染块级公式
+            formula = part.strip("$$").replace("\n", "").strip()
+            st.latex(formula)
+        # 行内公式（$...$）
+        elif part.startswith("$") and part.endswith("$"):
+            # 行内公式直接拼接到 current_text 中，保持和文本同行
+            formula = part.strip("$").strip()
+            current_text += f" ${formula}$ "
+        # 普通文本
+        else:
+            current_text += part
+    
+    # 输出最后一段累积的文本
+    if current_text.strip():
+        st.markdown(current_text, unsafe_allow_html=True)
 
 # ===================== 界面布局 =====================
 # 主标题
@@ -294,6 +403,7 @@ with col2:
         if st.button("🧹 清空对话历史", type="secondary"):
             st.session_state.chat_history = []
             st.success("✅ 已清空对话历史！")
+            st.balloons()
     else:
         st.info("暂无上传文件，请先添加文件后提问")
 
@@ -306,7 +416,9 @@ if st.session_state.chat_history:
     for q, a in st.session_state.chat_history:
         st.chat_message("user").write(f"**你**：{q}")
         st.chat_message("assistant").write(f"**助手**：{a}")
+        render_text_with_formulas(a)
 
+        
 # 提问区域
 question = st.text_input("请输入你的问题（支持上下文对话）：", placeholder="比如：文档中提到的核心功能是什么？", label_visibility="collapsed")
 if st.button("🚀 获取答案", use_container_width=True):
@@ -320,7 +432,9 @@ if st.button("🚀 获取答案", use_container_width=True):
         )
         if answer:
             # 显示回答
-            st.chat_message("assistant").write(f"**助手**：{answer}")
+            # 关键修改：用自定义函数渲染（自动拆分公式）
+            st.chat_message("assistant").write("**助手**：")
+            render_text_with_formulas(answer)
             # 保存到历史
             st.session_state.chat_history.append((question, answer))
     else:
